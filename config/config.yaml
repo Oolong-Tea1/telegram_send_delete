@@ -1,0 +1,46 @@
+account:
+  # Primary session base name (session file should be accounts/<session>.session)
+  session: "account1"
+
+telethon:
+  api_id: 12345678
+  api_hash: "your_api_hash_here"
+
+send:
+  min_interval: 8
+  max_interval: 15
+  rest_every: 20
+  rest_seconds: 300
+  shuffle: true
+  auto_delete: true
+  delete_after: 30
+  # whether to fetch latest message each run if message_id is null
+  fetch_latest_each_run: true
+  # message_id: null to use latest message
+  message_id: null
+
+filter:
+  blacklist:
+    - "测试群"
+  whitelist: []
+  skip_channels: true
+  skip_no_permission: true
+
+delete:
+  no_delete_groups:
+    - "客户总群"
+    - "VIP群"
+
+scheduler:
+  enable: true
+  run_on_start: true
+  schedule_times:
+    - "09:00"
+    - "12:00"
+    - "15:00"
+    - "18:00"
+    - "21:00"
+
+logging:
+  level: "INFO"
+  logs_dir: "logs"
