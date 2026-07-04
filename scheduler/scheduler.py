@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from datetime import datetime,timedelta
 from typing import List, Optional
 from managers.config_manager import ConfigManager
 from managers.group_manager import GroupManager, GroupInfo
@@ -56,7 +57,7 @@ class Scheduler:
                 try:
                     # call sender primitives - here we assume sending the same message; Sender is single-responsibility
                     # message content should be fetched/prepared outside Scheduler in a real system
-                    message_text = "Broadcast test message"  # placeholder
+                    message_text = "@haiwaifwqbot 1"  # placeholder
                     msg = await self.sender.send_message(g.raw, message_text)
                     # schedule delete if configured and group not in no_delete
                     if self.config.send.auto_delete:

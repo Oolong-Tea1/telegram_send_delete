@@ -24,7 +24,7 @@ class DeleteManager:
         """
         asyncio.create_task(self._delete_task(chat, message_id, delay_seconds))
 
-    async def _delete_task(self, chat: Any, message_id: int, delay_seconds: int) -> None:
+    async def _delete_task(self, chat: Any, message_id: Any, delay_seconds: int) -> None:
         try:
             # check group whitelist
             title = getattr(chat, "title", None) or getattr(chat, "name", None) or ""
@@ -33,9 +33,14 @@ class DeleteManager:
                 return
             await asyncio.sleep(delay_seconds)
             try:
-                await self.client.delete_messages(chat, ids=message_id)
-                logger.info("Deleted message %s in chat %s", message_id, title)
-            except errors.RPCError as e:
+                # normalize message_id (allow Message object or int)
+                mid = message_id.id if hasattr(message_id, "id") else message_id
+                # Telethon current API expects message id(s) as positional or message_ids=
+                # Pass single id as positional argument
+                await self.client.delete_messages(chat, mid)
+                logger.info("Deleted message %s in chat %s", mid, title)
+            except Exception as e:
+                # Telethon may raise RPCError, FloodWaitError, etc.
                 logger.warning("Failed to delete message %s in chat %s: %s", message_id, title, e)
         except asyncio.CancelledError:
             logger.info("Delete task cancelled for message %s", message_id)

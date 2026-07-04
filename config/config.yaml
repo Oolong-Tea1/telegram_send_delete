@@ -3,17 +3,17 @@ account:
   session: "account1"
 
 telethon:
-  api_id: 12345678
-  api_hash: "your_api_hash_here"
+  api_id: 35527289
+  api_hash: "ccb58763dea1f6f4f54c94adf462703b"
 
 send:
-  min_interval: 8
-  max_interval: 15
+  min_interval: 30
+  max_interval: 300
   rest_every: 20
   rest_seconds: 300
   shuffle: true
   auto_delete: true
-  delete_after: 30
+  delete_after: 10
   # whether to fetch latest message each run if message_id is null
   fetch_latest_each_run: true
   # message_id: null to use latest message
