@@ -6,7 +6,7 @@ import json
 import os
 from datetime import datetime
 from typing import Optional, Any
-from telethon import events
+from telethon import events, functions, types
 from utils.logger import setup_logger
 
 logger = setup_logger("monitor")
@@ -16,12 +16,7 @@ class Monitor:
     """
     Monitor handles pause control (via control.json) and channel-join logging.
 
-    Usage:
-      monitor = Monitor(client, logs_dir="logs")
-      monitor.start()
-
-    It exposes an asyncio.Event `can_send` which is set when sending is allowed.
-    A PausableSender wraps an existing Sender and awaits this event before delegating.
+    It only logs joins for channels that were created by the current session (the logged-in account).
     """
 
     def __init__(self, client: Any, control_path: str = "control.json", logs_dir: str = "logs", poll_interval: float = 3.0):
@@ -34,9 +29,13 @@ class Monitor:
         self.can_send = asyncio.Event()
         self.can_send.set()
         self._control_task: Optional[asyncio.Task] = None
+        self._init_task: Optional[asyncio.Task] = None
         self._handler = None
         # log file for channel joins
         self.join_log_path = os.path.join(self.logs_dir, "channel_joins.log")
+        # tracked owned channels (ids) created by this session
+        self._owned_channel_ids: set[int] = set()
+        self._me_id: Optional[int] = None
 
     def start(self) -> None:
         # register event handler for ChatAction
@@ -48,6 +47,8 @@ class Monitor:
             self._handler = self._on_chat_action
         # start control loop
         self._control_task = asyncio.create_task(self._control_loop())
+        # start background initialization to discover owned channels
+        self._init_task = asyncio.create_task(self._init_owned_channels())
         logger.info("Monitor started: control=%s join_log=%s", self.control_path, self.join_log_path)
 
     async def stop(self) -> None:
@@ -55,6 +56,12 @@ class Monitor:
             self._control_task.cancel()
             try:
                 await self._control_task
+            except asyncio.CancelledError:
+                pass
+        if self._init_task:
+            self._init_task.cancel()
+            try:
+                await self._init_task
             except asyncio.CancelledError:
                 pass
         # remove event handler if possible
@@ -104,11 +111,55 @@ class Monitor:
                 logger.exception("Unexpected error in control loop: %s", e)
                 await asyncio.sleep(self.poll_interval)
 
+    async def _init_owned_channels(self) -> None:
+        """Discover channels that were created by the current session account.
+
+        This task runs once at startup and populates self._owned_channel_ids. It uses
+        channels.GetParticipantsRequest to inspect participant types and finds
+        ChannelParticipantCreator entries that match the current account id.
+        """
+        try:
+            me = await self.client.get_me()
+            if me is None:
+                logger.warning("Unable to get current user (get_me returned None)")
+                return
+            self._me_id = getattr(me, "id", None)
+            dialogs = await self.client.get_dialogs()
+            owned = set()
+            for d in dialogs:
+                entity = d.entity
+                # consider only broadcast channels (not megagroups / supergroups)
+                is_channel = getattr(entity, "broadcast", False)
+                is_super = getattr(entity, "megagroup", False) if hasattr(entity, "megagroup") else False
+                if not is_channel or is_super:
+                    continue
+                try:
+                    # Use low-level GetParticipantsRequest to get participant objects (creator/admin types)
+                    res = await self.client(functions.channels.GetParticipantsRequest(channel=entity, filter=types.ChannelParticipantsAdmins(), offset=0, limit=100, hash=0))
+                    participants = getattr(res, "participants", [])
+                    for p in participants:
+                        # check for ChannelParticipantCreator type
+                        if isinstance(p, types.ChannelParticipantCreator):
+                            if getattr(p, "user_id", None) == self._me_id:
+                                owned.add(getattr(entity, "id", None))
+                                break
+                except Exception as e:
+                    # ignore channels we cannot inspect
+                    logger.debug("Skipping channel %s during owner discovery: %s", getattr(entity, "title", getattr(entity, "id", None)), e)
+            self._owned_channel_ids = {i for i in owned if i is not None}
+            logger.info("Discovered %d owned channels", len(self._owned_channel_ids))
+        except asyncio.CancelledError:
+            logger.info("Owned channels init cancelled")
+        except Exception as e:
+            logger.exception("Failed to initialize owned channels: %s", e)
+
     async def _on_chat_action(self, event: events.ChatAction.Event) -> None:
-        """Handle new users joining a channel/group. Write a simple log entry per join."""
+        """Handle new users joining a channel/group. Write a simple log entry per join.
+
+        Only logs when the chat is a channel created by this session's account.
+        """
         try:
             # Only consider join/add events
-            # Telethon's ChatAction has attributes: user_joined, user_added, users
             is_join = getattr(event, "user_joined", False) or getattr(event, "user_added", False)
             users = []
             if getattr(event, "user", None):
@@ -118,18 +169,30 @@ class Monitor:
             # if no explicit flags, still treat presence of users as join
             if not is_join and not users:
                 return
-            # determine chat title
+            # determine chat entity and id
             try:
                 chat = await event.get_chat()
             except Exception:
                 chat = getattr(event, "chat", None)
-            channel_title = getattr(chat, "title", None) or getattr(chat, "name", None) or str(getattr(chat, "id", ""))
+            channel_id = getattr(chat, "id", None)
+            # ensure it's a broadcast channel (not a supergroup) and owned by this session
+            is_channel = getattr(chat, "broadcast", False)
+            is_super = getattr(chat, "megagroup", False) if hasattr(chat, "megagroup") else False
+            if not is_channel or is_super:
+                return
+            # if owned channels not yet discovered, skip until discovery finishes
+            if self._owned_channel_ids and channel_id not in self._owned_channel_ids:
+                return
+            if not self._owned_channel_ids:
+                # still initializing: skip to avoid logging non-owned channels
+                return
+
+            channel_title = getattr(chat, "title", None) or getattr(chat, "name", None) or str(channel_id)
 
             for u in users:
                 username = getattr(u, "username", "") or ""
                 user_id = getattr(u, "id", "")
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                # Write the fixed-format block. Use blank lines between lines to match example.
                 entry = (
                     "CHANNEL_JOIN\n\n"
                     f"channel={channel_title}\n\n"
@@ -137,7 +200,6 @@ class Monitor:
                     f"user_id={user_id}\n\n"
                     f"time={ts}\n\n"
                 )
-                # append to log file
                 try:
                     with open(self.join_log_path, "a", encoding="utf-8") as fh:
                         fh.write(entry)
