@@ -19,12 +19,11 @@ class Monitor:
     Behavior additions:
     - On first startup, discovers "owned" broadcast channels and records a snapshot
       of their current member ids to a cache file (owned_members.json).
-    - Periodically (check_interval) it re-checks members for owned channels and
-      logs any newly added members, then updates the snapshot.
-
-    This design avoids modifying Scheduler: Monitor runs its own background
-    periodic checker and will notify (via log) when new members appear since
-    the last snapshot.
+    - Exposes run_members_check_once() which fetches members for each owned channel,
+      writes per-channel JSON files (channel_<id>.json) and appends new members to
+      the channel_joins.log. This is intended to be called by Scheduler during rest.
+    - Also runs a periodic background check loop by default, but Scheduler can
+      trigger immediate checks by calling run_members_check_once().
     """
 
     def __init__(self, client: Any, control_path: str = "control.json", logs_dir: str = "logs", poll_interval: float = 3.0, check_interval: float = 30.0):
@@ -33,7 +32,7 @@ class Monitor:
         self.logs_dir = logs_dir
         os.makedirs(self.logs_dir, exist_ok=True)
         self.poll_interval = poll_interval
-        # how often to check members for new joins (seconds)
+        # how often to check members for new joins (seconds) for background loop
         self.check_interval = check_interval
         # Event that is set when sending is allowed. Start as set (not paused) until control.json says otherwise.
         self.can_send = asyncio.Event()
@@ -47,7 +46,7 @@ class Monitor:
         # cache of owned channels (ids) created by this session
         self._owned_channel_ids: Set[int] = set()
         self._me_id: Optional[int] = None
-        # snapshot file for members
+        # snapshot file for members (global mapping)
         self._members_snapshot_path = os.path.join(self.logs_dir, "owned_members.json")
         self._members_snapshot: Dict[str, Set[int]] = {}
 
@@ -233,6 +232,67 @@ class Monitor:
                 break
         return ids
 
+    async def run_members_check_once(self) -> None:
+        """Fetch members for all owned channels, update per-channel json files, and log newly added members."""
+        # ensure we have owned channels discovered
+        if not self._owned_channel_ids:
+            # try a quick re-init if discovery did not run
+            try:
+                await self._init_owned_channels()
+            except Exception:
+                return
+        for cid in list(self._owned_channel_ids):
+            key = str(cid)
+            try:
+                current_ids = await self._fetch_all_member_ids(cid)
+            except Exception as e:
+                logger.debug("Failed to fetch members for channel %s during manual check: %s", cid, e)
+                continue
+            # load per-channel snapshot file
+            per_path = os.path.join(self.logs_dir, f"channel_{cid}.json")
+            old_ids: Set[int] = set()
+            if os.path.exists(per_path):
+                try:
+                    with open(per_path, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    old_ids = set(data.get("members", []))
+                except Exception as e:
+                    logger.debug("Failed to load per-channel snapshot %s: %s", per_path, e)
+            new_ids = current_ids - old_ids
+            if new_ids:
+                for uid in new_ids:
+                    try:
+                        ent = await self.client.get_entity(uid)
+                        username = getattr(ent, "username", "") or ""
+                    except Exception:
+                        username = ""
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    entry = (
+                        "CHANNEL_JOIN\n\n"
+                        f"channel={cid}\n\n"
+                        f"username={username}\n\n"
+                        f"user_id={uid}\n\n"
+                        f"time={ts}\n\n"
+                    )
+                    try:
+                        with open(self.join_log_path, "a", encoding="utf-8") as fh:
+                            fh.write(entry)
+                        logger.info("Detected new member in channel %s: %s", cid, uid)
+                    except Exception as e:
+                        logger.exception("Failed to write join log for detected member: %s", e)
+            # always update per-channel snapshot to reflect current state
+            try:
+                with open(per_path, "w", encoding="utf-8") as fh:
+                    json.dump({"members": list(current_ids), "updated": datetime.now().isoformat()}, fh, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.exception("Failed to write per-channel snapshot %s: %s", per_path, e)
+            # update global snapshot mapping as well
+            self._members_snapshot[key] = current_ids
+            # gentle delay
+            await asyncio.sleep(0.3)
+        # persist global snapshot
+        await self._save_snapshot()
+
     async def _members_check_loop(self) -> None:
         # wait until initial discovery/snapshot attempted
         while self._init_task and not self._init_task.done():
@@ -243,44 +303,7 @@ class Monitor:
         # periodic check
         while True:
             try:
-                # for each owned channel, compare current members to snapshot
-                for cid in list(self._owned_channel_ids):
-                    key = str(cid)
-                    try:
-                        current_ids = await self._fetch_all_member_ids(cid)
-                    except Exception as e:
-                        logger.debug("Failed to fetch members for channel %s: %s", cid, e)
-                        continue
-                    old_ids = self._members_snapshot.get(key, set())
-                    new_ids = current_ids - old_ids
-                    if new_ids:
-                        # For each new id, attempt to resolve username and log a notification entry
-                        for uid in new_ids:
-                            try:
-                                ent = await self.client.get_entity(uid)
-                                username = getattr(ent, "username", "") or ""
-                            except Exception:
-                                username = ""
-                            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            # append to join log the same format used elsewhere
-                            entry = (
-                                "CHANNEL_JOIN\n\n"
-                                f"channel={cid}\n\n"
-                                f"username={username}\n\n"
-                                f"user_id={uid}\n\n"
-                                f"time={ts}\n\n"
-                            )
-                            try:
-                                with open(self.join_log_path, "a", encoding="utf-8") as fh:
-                                    fh.write(entry)
-                                logger.info("Detected new member in channel %s: %s", cid, uid)
-                            except Exception as e:
-                                logger.exception("Failed to write join log for detected member: %s", e)
-                        # update snapshot
-                        self._members_snapshot[key] = current_ids
-                        await self._save_snapshot()
-                    # gentle delay to avoid rate limits
-                    await asyncio.sleep(0.3)
+                await self.run_members_check_once()
                 await asyncio.sleep(self.check_interval)
             except asyncio.CancelledError:
                 logger.info("Members check loop cancelled")
