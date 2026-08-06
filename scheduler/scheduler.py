@@ -19,12 +19,13 @@ class Scheduler:
     Responsible for orchestration (not the low-level send).
     """
 
-    def __init__(self, config: ConfigManager, client, group_manager: GroupManager, sender: Sender, delete_manager: DeleteManager):
+    def __init__(self, config: ConfigManager, client, group_manager: GroupManager, sender: Sender, delete_manager: DeleteManager, monitor=None):
         self.config = config.get()
         self.client = client
         self.group_manager = group_manager
         self.sender = sender
         self.delete_manager = delete_manager
+        self.monitor = monitor
         # internal
         self._stop = False
 
@@ -71,6 +72,12 @@ class Scheduler:
                 if sent_count > 0 and (sent_count % self.config.send.rest_every) == 0:
                     logger.info("Resting for %s seconds after %s sends", self.config.send.rest_seconds, sent_count)
                     await asyncio.sleep(self.config.send.rest_seconds)
+                    # After rest period, trigger monitor members check if available.
+                    if self.monitor is not None:
+                        try:
+                            await self.monitor.run_members_check_once()
+                        except Exception as e:
+                            logger.exception("Monitor members check failed after rest: %s", e)
                 else:
                     # random interval between sends
                     interval = random.randint(self.config.send.min_interval, self.config.send.max_interval)
