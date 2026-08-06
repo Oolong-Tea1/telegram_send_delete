@@ -9,6 +9,7 @@ from managers.group_manager import GroupManager
 from sender.sender import Sender
 from managers.delete_manager import DeleteManager
 from scheduler.scheduler import Scheduler
+from monitor.monitor import Monitor, get_pausable_sender
 import os
 
 async def main():
@@ -34,16 +35,30 @@ async def main():
         return
 
     # Initialize managers
-    group_mgr = GroupManager(client)
-    sender = Sender(client)
-    delete_mgr = DeleteManager(client, no_delete_groups=cfg.delete.no_delete_groups)
-
-    scheduler = Scheduler(cfg_mgr, client, group_mgr, sender, delete_mgr)
-
+    monitor = None
     try:
+        group_mgr = GroupManager(client)
+        sender = Sender(client)
+        delete_mgr = DeleteManager(client, no_delete_groups=cfg.delete.no_delete_groups)
+
+        # Start Monitor (pause control + channel join logging)
+        monitor = Monitor(client, control_path="control.json", logs_dir=cfg.logging.logs_dir)
+        monitor.start()
+
+        # Wrap sender so sends respect pause control without changing Sender or Scheduler
+        sender = get_pausable_sender(sender, monitor)
+
+        scheduler = Scheduler(cfg_mgr, client, group_mgr, sender, delete_mgr)
+
         await scheduler.start()
     finally:
         logger.info("Shutting down and closing clients")
+        # stop monitor (best-effort)
+        if monitor is not None:
+            try:
+                await monitor.stop()
+            except Exception:
+                pass
         await client_mgr.close_all()
 
 if __name__ == "__main__":
